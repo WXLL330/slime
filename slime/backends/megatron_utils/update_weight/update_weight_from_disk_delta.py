@@ -19,6 +19,7 @@ import zstandard
 from megatron.core import mpu
 from ray.actor import ActorHandle
 
+from slime.backends.sglang_utils.mxfp8_weight_sync import run_rank_0_update_phase, uses_online_mxfp8
 from slime.utils import accelerator
 from slime.utils.disk_delta import NUM_WORKERS, checksum, make_tensor_reader, overwrite_encode
 from slime.utils.distributed_utils import get_gloo_group
@@ -174,10 +175,21 @@ class UpdateWeightFromDiskDelta(UpdateWeightFromDistributed):
         if self._post_write_hook is not None:
             self._post_write_hook(self.args, self._version_dir, list(self.rollout_engines))
         dist.barrier(group=get_gloo_group())
-        if dist.get_rank() == 0:
+
+        def reload_rollout_engines() -> None:
             ray.get([engine.pull_weights.remote(self.weight_version) for engine in self.rollout_engines])
             ray.get([engine.pause_generation.remote() for engine in self.rollout_engines])
             ray.get([engine.flush_cache.remote() for engine in self.rollout_engines])
+            if uses_online_mxfp8(self.args):
+                ray.get(
+                    [
+                        engine.post_process_weights.remote(
+                            restore_weights_before_load=True,
+                            post_process_quantization=False,
+                        )
+                        for engine in self.rollout_engines
+                    ]
+                )
             ray.get(
                 [
                     engine.update_weights_from_disk.remote(
@@ -188,7 +200,12 @@ class UpdateWeightFromDiskDelta(UpdateWeightFromDistributed):
                 ]
             )
             ray.get([engine.continue_generation.remote() for engine in self.rollout_engines])
-        dist.barrier(group=get_gloo_group())
+
+        run_rank_0_update_phase(
+            "disk-delta rollout weight reload",
+            reload_rollout_engines,
+            rollback_engines=self.rollout_engines if uses_online_mxfp8(self.args) else None,
+        )
 
     def _iter_hf_tensors(self):
         """Yield (name, gathered HF tensor) for every param: base-class TP then EP gather passes."""

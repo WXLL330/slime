@@ -3,6 +3,8 @@ import logging
 
 from sglang.srt.server_args import ServerArgs
 from sglang_router.launch_router import RouterArgs
+
+from slime.backends.sglang_utils.mxfp8_weight_sync import uses_online_mxfp8
 from slime.utils.http_utils import _wrap_ipv6
 
 logger = logging.getLogger(__name__)
@@ -145,6 +147,14 @@ def add_sglang_arguments(parser):
 
 
 def validate_args(args):
+    if uses_online_mxfp8(args) and getattr(args, "rollout_external", False):
+        raise ValueError(
+            "Online MXFP8 BF16 weight synchronization requires Slime-managed SGLang servers; "
+            "external rollout engines do not install the Slime MXFP8 runtime patch"
+        )
+    if uses_online_mxfp8(args) and getattr(args, "num_experts", None):
+        raise ValueError("Online MXFP8 BF16 weight synchronization currently supports dense models only")
+
     # Older SGLang versions stored these CLI aliases under their long names,
     # while newer versions use the short ServerArgs field names as argparse dests.
     # Keep both attributes available for user code, preferring the newer names

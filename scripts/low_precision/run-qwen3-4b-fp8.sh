@@ -25,7 +25,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 source "${SCRIPT_DIR}/../models/qwen3-4B.sh"
 
 CKPT_ARGS=(
-   --hf-checkpoint /workspace/rl-project/slime_dev/slime/fp8_models/Qwen3-4B-fp8
+   --hf-checkpoint /root/models/Qwen3-4B
    --ref-load /workspace/rl-project/slime_dev/slime/mg_models/qwen3-4b-mg
    # --load /root/qwen3-4b_cp8_fp8
    --save ./ckpt/qwen3-4b-fp8-dapo-math-17k
@@ -115,6 +115,8 @@ WANDB_ARGS=(
 
 SGLANG_ARGS=(
    --rollout-num-gpus-per-engine 2
+   --sglang-quantization mxfp8
+   --sglang-fp8-gemm-backend triton
    --sglang-server-concurrency 160
    --sglang-mem-fraction-static 0.7
 )

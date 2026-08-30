@@ -13,12 +13,19 @@ from ray import ObjectRef
 from ray.actor import ActorHandle
 from tqdm import tqdm
 
+from slime.backends.sglang_utils.mxfp8_weight_sync import (
+    Rank0UpdatePhaseError,
+    abort_online_mxfp8_weight_update,
+    requires_weight_requantization,
+    run_rank_0_update_phase,
+    uses_online_mxfp8,
+)
 from slime.utils import accelerator
 from slime.utils.distributed_utils import get_gloo_group, init_process_group
 from slime.utils.http_utils import _wrap_ipv6
 
 from ..megatron_to_hf import convert_to_hf
-from .common import all_gather_param, named_params_and_buffers
+from .common import all_gather_param, named_params_and_buffers, raise_if_any_rank_failed
 
 
 class UpdateWeightFromDistributed:
@@ -102,37 +109,57 @@ class UpdateWeightFromDistributed:
 
     @torch.no_grad()
     def update_weights(self) -> None:
+        self.weight_version += 1
+        try:
+            self._update_weights()
+        except Rank0UpdatePhaseError:
+            raise
+        except Exception:
+            if dist.get_rank() == 0 and uses_online_mxfp8(self.args):
+                abort_online_mxfp8_weight_update(self.rollout_engines)
+            raise
+
+    def _update_weights(self) -> None:
         """
         Pause → flush → _send_weights → continue. Progress on PP source.
         """
-        self.weight_version += 1
 
-        if dist.get_rank() == 0:
+        def prepare_rollout_engines() -> None:
             ray.get([engine.pause_generation.remote() for engine in self.rollout_engines])
             ray.get([engine.flush_cache.remote() for engine in self.rollout_engines])
 
             # int4/fp4 pre_process
-            if self.quantization_config and self.quantization_config["quant_method"] in ["compressed-tensors"]:
+            if requires_weight_requantization(self.args, self.quantization_config):
                 post_process_weights(
                     restore_weights_before_load=True,
                     post_process_quantization=False,
                     rollout_engines=self.rollout_engines,
                 )
-        dist.barrier(group=get_gloo_group())
+
+        run_rank_0_update_phase(
+            "rollout weight-update prepare",
+            prepare_rollout_engines,
+            rollback_engines=self.rollout_engines if uses_online_mxfp8(self.args) else None,
+        )
 
         pbar = tqdm(desc=f"[{self._group_name}] Update weights", total=0) if self._is_pp_src_rank else None
         self._send_weights(pbar)
 
-        if dist.get_rank() == 0:
+        def finalize_rollout_engines() -> None:
             # int4/fp4 post_process
-            if self.quantization_config and self.quantization_config["quant_method"] in ["compressed-tensors"]:
+            if requires_weight_requantization(self.args, self.quantization_config):
                 post_process_weights(
                     restore_weights_before_load=False,
                     post_process_quantization=True,
                     rollout_engines=self.rollout_engines,
                 )
             ray.get([engine.continue_generation.remote() for engine in self.rollout_engines])
-        dist.barrier(group=get_gloo_group())
+
+        run_rank_0_update_phase(
+            "rollout weight-update finalize",
+            finalize_rollout_engines,
+            rollback_engines=self.rollout_engines if uses_online_mxfp8(self.args) else None,
+        )
 
     def _send_weights(self, pbar: tqdm | None) -> None:
         """
@@ -140,11 +167,21 @@ class UpdateWeightFromDistributed:
         yields broadcast-ready chunks (bucketing happens internally); subclasses
         override ``_on_chunk`` to inject per-chunk behaviour.
         """
-        for chunk_iter in (self._iter_non_expert_chunks(), self._iter_expert_chunks()):
+        for phase, chunk_iter in (
+            ("non-expert rollout weight transfer", self._iter_non_expert_chunks()),
+            ("expert rollout weight transfer", self._iter_expert_chunks()),
+        ):
+            local_error = None
             for hf_chunk in chunk_iter:
-                self._on_chunk(hf_chunk)
-                self._update_bucket_weights_from_distributed(hf_chunk, pbar=pbar)
-            dist.barrier(group=get_gloo_group())
+                if local_error is not None:
+                    continue
+                try:
+                    self._on_chunk(hf_chunk)
+                    self._update_bucket_weights_from_distributed(hf_chunk, pbar=pbar)
+                except Exception as exc:
+                    local_error = exc
+                    hf_chunk.clear()
+            raise_if_any_rank_failed(local_error, phase)
 
     def _on_chunk(self, hf_chunk: list[tuple[str, torch.Tensor]]) -> None:
         """
@@ -248,22 +285,27 @@ class UpdateWeightFromDistributed:
         Lock → transfer → clear → unlock → pbar++. Lock prevents communication deadlock.
         """
         # Lock the rollout engines to prevent communication deadlock.
-        while not ray.get(self.rollout_engine_lock.acquire.remote()):
-            time.sleep(0.1)
+        acquired = False
+        try:
+            while not ray.get(self.rollout_engine_lock.acquire.remote()):
+                time.sleep(0.1)
+            acquired = True
 
-        refs = update_weights_from_distributed(
-            self._group_name,
-            self._model_update_groups,
-            self.weight_version,
-            self.rollout_engines,
-            converted_named_tensors,
-            load_format=load_format,
-        )
+            refs = update_weights_from_distributed(
+                self._group_name,
+                self._model_update_groups,
+                self.weight_version,
+                self.rollout_engines,
+                converted_named_tensors,
+                load_format=load_format,
+            )
 
-        ray.get(refs)
-        converted_named_tensors.clear()
-        ray.get(self.rollout_engine_lock.release.remote())
-        pbar.update(1)
+            ray.get(refs)
+            converted_named_tensors.clear()
+            pbar.update(1)
+        finally:
+            if acquired:
+                ray.get(self.rollout_engine_lock.release.remote())
 
 
 def connect_rollout_engines_from_distributed(
@@ -362,7 +404,7 @@ def post_process_weights(
     rollout_engines: Sequence[ActorHandle],
 ):
     """
-    Trigger post-process for int4/fp4 quantization on all rollout engines.
+    Restore or post-process quantized weights on all rollout engines.
     """
     ray.get(
         [

@@ -18,6 +18,19 @@ from slime.utils.http_utils import get_host_info
 logger = logging.getLogger(__name__)
 
 
+def _launch_server_with_slime_patches(server_args: ServerArgs) -> None:
+    from slime.backends.sglang_utils.mxfp8_weight_sync import (
+        install_online_mxfp8_weight_sync_patch,
+        run_scheduler_process_with_slime_patches,
+    )
+
+    install_online_mxfp8_weight_sync_patch()
+
+    from sglang.srt.entrypoints.http_server import launch_server
+
+    launch_server(server_args, run_scheduler_process_func=run_scheduler_process_with_slime_patches)
+
+
 def get_base_gpu_id(args, rank):
     num_gpus = min(args.num_gpus_per_node, args.rollout_num_gpus_per_engine)
     if args.colocate:
@@ -45,11 +58,9 @@ def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
             wait_for_server=True,
         )
 
-    from sglang.srt.entrypoints.http_server import launch_server
-
     multiprocessing.set_start_method("spawn", force=True)
     server_args.host = server_args.host.strip("[]")
-    p = multiprocessing.Process(target=launch_server, args=(server_args,))
+    p = multiprocessing.Process(target=_launch_server_with_slime_patches, args=(server_args,))
     p.start()
 
     if getattr(server_args, "node_rank", 0) != 0:
@@ -445,8 +456,14 @@ class SGLangEngine(RayActor):
         This is used for restore-before-load and post-load quantization hooks.
         """
 
+        from slime.backends.sglang_utils.mxfp8_weight_sync import (
+            SLIME_POST_PROCESS_WEIGHTS_ENDPOINT,
+            uses_online_mxfp8,
+        )
+
+        endpoint = SLIME_POST_PROCESS_WEIGHTS_ENDPOINT if uses_online_mxfp8(self.args) else "post_process_weights"
         return self._make_request(
-            "post_process_weights",
+            endpoint,
             {
                 "restore_weights_before_load": restore_weights_before_load,
                 "post_process_quantization": post_process_quantization,

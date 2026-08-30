@@ -9,7 +9,27 @@ from megatron.core import mpu
 from megatron.core.transformer.transformer_layer import get_transformer_layer_offset
 
 from slime.backends.megatron_utils.misc_utils import strip_param_name_prefix
+from slime.utils.distributed_utils import get_gloo_group
 from slime.utils.types import ParamInfo
+
+
+class WeightTransferError(RuntimeError):
+    """A rank-local rollout transfer failure reported to every training rank."""
+
+
+def raise_if_any_rank_failed(local_error: Exception | None, phase: str) -> None:
+    """Synchronize rank-local transfer results and raise the same error on all ranks."""
+    group = get_gloo_group()
+    rank = dist.get_rank()
+    local_message = None
+    if local_error is not None:
+        local_message = f"rank {rank}: {type(local_error).__name__}: {local_error}"
+
+    messages: list[str | None] = [None] * dist.get_world_size(group)
+    dist.all_gather_object(messages, local_message, group=group)
+    failures = [message for message in messages if message is not None]
+    if failures:
+        raise WeightTransferError(f"{phase} failed: {'; '.join(failures)}") from local_error
 
 
 def all_gather_param(name: str, param: torch.nn.Parameter) -> torch.Tensor:

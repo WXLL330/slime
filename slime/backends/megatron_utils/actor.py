@@ -12,6 +12,7 @@ from megatron.core import mpu
 from torch_memory_saver import torch_memory_saver
 from transformers import AutoConfig, AutoTokenizer
 
+from slime.backends.sglang_utils.mxfp8_weight_sync import uses_online_mxfp8
 from slime.observability import train_data_utils, train_metric_utils
 from slime.observability.logging_utils import init_tracking
 from slime.observability.profile_utils import TrainProfiler
@@ -92,6 +93,14 @@ class MegatronTrainRayActor(TrainRayActor):
             dist.barrier(group=get_gloo_group())
 
         dist.barrier(group=get_gloo_group())
+
+        if role == "actor" and uses_online_mxfp8(args):
+            quantization_config = getattr(self.hf_config, "quantization_config", None)
+            if quantization_config is not None:
+                raise ValueError(
+                    "Online MXFP8 rollout requires an unquantized BF16/FP16 --hf-checkpoint; "
+                    f"found quantization_config={quantization_config}"
+                )
 
         self.model, self.optimizer, self.opt_param_scheduler, loaded_rollout_id = initialize_model_and_optimizer(
             args, role

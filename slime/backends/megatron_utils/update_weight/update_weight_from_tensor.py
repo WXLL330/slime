@@ -11,12 +11,20 @@ from ray import ObjectRef
 from ray.actor import ActorHandle
 from tqdm import tqdm
 
+from slime.backends.sglang_utils.mxfp8_weight_sync import (
+    Rank0UpdatePhaseError,
+    abort_online_mxfp8_weight_update,
+    requires_weight_requantization,
+    run_rank_0_update_phase,
+    uses_online_mxfp8,
+)
 from slime.utils import accelerator
 from slime.utils.distributed_utils import get_gloo_group
 from slime.utils.types import ParamInfo
 
 from ..megatron_to_hf import convert_to_hf
 from ..sglang import FlattenedTensorBucket, MultiprocessingSerializer
+from .common import raise_if_any_rank_failed
 from .expert_routing import configure_expert_routing
 from .hf_weight_iterator_base import HfWeightIteratorBase
 from .update_weight_from_distributed import (
@@ -276,21 +284,36 @@ class UpdateWeightFromTensor:
 
     @torch.no_grad()
     def update_weights(self) -> None:
+        self.weight_version += 1
+        try:
+            self._update_weights()
+        except Rank0UpdatePhaseError:
+            raise
+        except Exception:
+            if self.rank == 0 and uses_online_mxfp8(self.args):
+                abort_online_mxfp8_weight_update(self.rollout_engines)
+            raise
+
+    def _update_weights(self) -> None:
         """
         version++, flush caches, process buckets. Progress on rank 0.
         """
-        self.weight_version += 1
 
-        if self.rank == 0:
+        def prepare_rollout_engines() -> None:
             ray.get([engine.pause_generation.remote() for engine in self.rollout_engines])
             ray.get([engine.flush_cache.remote() for engine in self.rollout_engines])
-            if self.quantization_config and self.quantization_config["quant_method"] in ["compressed-tensors"]:
+            if requires_weight_requantization(self.args, self.quantization_config):
                 post_process_weights(
                     restore_weights_before_load=True,
                     post_process_quantization=False,
                     rollout_engines=self.rollout_engines,
                 )
-        dist.barrier(group=get_gloo_group())
+
+        run_rank_0_update_phase(
+            "rollout weight-update prepare",
+            prepare_rollout_engines,
+            rollback_engines=self.rollout_engines if uses_online_mxfp8(self.args) else None,
+        )
 
         megatron_local_weights = self.weights_getter()
 
@@ -301,14 +324,22 @@ class UpdateWeightFromTensor:
             megatron_local_weights,
             param_info_buckets=param_info_buckets,
         ):
-            refs, long_lived_tensors = self._send_hf_params(hf_named_tensors)
-            ray.get(refs)
-            # Free GPU tensors so the caching allocator can reuse the blocks,
-            # then release CUDA IPC cache entries whose consumers (sglang engines)
-            # have already closed their IPC handles.
-            del refs, long_lived_tensors, hf_named_tensors
-            accelerator.ipc_collect()
-            accelerator.empty_cache()
+            refs = []
+            long_lived_tensors = None
+            local_error = None
+            try:
+                refs, long_lived_tensors = self._send_hf_params(hf_named_tensors)
+                ray.get(refs)
+            except Exception as exc:
+                local_error = exc
+            finally:
+                # Free GPU tensors so the caching allocator can reuse the blocks,
+                # then release CUDA IPC cache entries whose consumers (sglang engines)
+                # have already closed their IPC handles.
+                del refs, long_lived_tensors, hf_named_tensors
+                accelerator.ipc_collect()
+                accelerator.empty_cache()
+            raise_if_any_rank_failed(local_error, "rollout tensor weight transfer")
 
         if self._expert_transfer_plan:
             self._update_expert_weights(megatron_local_weights)
@@ -321,15 +352,20 @@ class UpdateWeightFromTensor:
         accelerator.empty_cache()
 
         # int4/fp4 post_process
-        if self.rank == 0:
-            if self.quantization_config and self.quantization_config["quant_method"] in ["compressed-tensors"]:
+        def finalize_rollout_engines() -> None:
+            if requires_weight_requantization(self.args, self.quantization_config):
                 post_process_weights(
                     restore_weights_before_load=False,
                     post_process_quantization=True,
                     rollout_engines=self.rollout_engines,
                 )
             ray.get([engine.continue_generation.remote() for engine in self.rollout_engines])
-        dist.barrier(group=get_gloo_group())
+
+        run_rank_0_update_phase(
+            "rollout weight-update finalize",
+            finalize_rollout_engines,
+            rollback_engines=self.rollout_engines if uses_online_mxfp8(self.args) else None,
+        )
 
     def _send_hf_params(self, hf_named_tensors) -> tuple[list[ObjectRef], Any]:
         all_refs = []

@@ -30,5 +30,19 @@ def test_validate_args_canonicalizes_moe_data_parallel_size():
     assert args.sglang_moe_dp_size == 1
 
 
+def test_validate_args_rejects_external_online_mxfp8():
+    args = Namespace(sglang_quantization="mxfp8", rollout_external=True)
+
+    with pytest.raises(ValueError, match="Slime-managed SGLang servers"):
+        validate_args(args)
+
+
+def test_validate_args_rejects_online_mxfp8_moe():
+    args = Namespace(sglang_quantization="mxfp8", rollout_external=False, num_experts=8)
+
+    with pytest.raises(ValueError, match="dense models only"):
+        validate_args(args)
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__]))

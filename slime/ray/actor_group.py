@@ -7,6 +7,7 @@ import ray
 from ray.util.placement_group import PlacementGroup
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
+from slime.backends.sglang_utils.mxfp8_weight_sync import abort_online_mxfp8_weight_update, uses_online_mxfp8
 from slime.ray.utils import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST, add_default_ray_env_vars
 
 
@@ -241,29 +242,48 @@ class RayTrainGroup:
             model_path = self.args.update_weight_local_checkpoint_dir
         else:
             model_path = str(disk_weight_dir)
-        ray.get([engine.pause_generation.remote() for engine in engines])
-        ray.get([engine.flush_cache.remote() for engine in engines])
-        ray.get(
-            [
-                engine.update_weights_from_disk.remote(
-                    model_path=model_path,
-                    weight_version=weight_version,
+        pause_requested = False
+        try:
+            pause_requested = True
+            ray.get([engine.pause_generation.remote() for engine in engines])
+            ray.get([engine.flush_cache.remote() for engine in engines])
+            if uses_online_mxfp8(self.args):
+                ray.get(
+                    [
+                        engine.post_process_weights.remote(
+                            restore_weights_before_load=True,
+                            post_process_quantization=False,
+                        )
+                        for engine in engines
+                    ]
                 )
-                for engine in engines
-            ]
-        )
-        if self.args.ci_test:
-            engine_versions = ray.get([engine.get_weight_version.remote() for engine in engines])
-            mismatches = [
-                f"engine {idx}: {engine_version}"
-                for idx, engine_version in enumerate(engine_versions)
-                if str(engine_version) != str(weight_version)
-            ]
-            if mismatches:
-                raise RuntimeError(
-                    "Weight version mismatch after disk reload! "
-                    f"Expected: {weight_version}; " + ", ".join(mismatches)
-                )
-        if not self.args.update_weight_disk_keep_files:
-            shutil.rmtree(disk_weight_dir, ignore_errors=True)
-        ray.get([engine.continue_generation.remote() for engine in engines])
+            ray.get(
+                [
+                    engine.update_weights_from_disk.remote(
+                        model_path=model_path,
+                        weight_version=weight_version,
+                    )
+                    for engine in engines
+                ]
+            )
+            if self.args.ci_test:
+                engine_versions = ray.get([engine.get_weight_version.remote() for engine in engines])
+                mismatches = [
+                    f"engine {idx}: {engine_version}"
+                    for idx, engine_version in enumerate(engine_versions)
+                    if str(engine_version) != str(weight_version)
+                ]
+                if mismatches:
+                    raise RuntimeError(
+                        "Weight version mismatch after disk reload! "
+                        f"Expected: {weight_version}; " + ", ".join(mismatches)
+                    )
+            if not self.args.update_weight_disk_keep_files:
+                shutil.rmtree(disk_weight_dir, ignore_errors=True)
+        except Exception:
+            if uses_online_mxfp8(self.args):
+                abort_online_mxfp8_weight_update(engines, resume=False)
+            raise
+        finally:
+            if pause_requested:
+                ray.get([engine.continue_generation.remote() for engine in engines])
