@@ -168,6 +168,31 @@ def test_allgather_cp_ignores_cp_size_one(monkeypatch):
 
 
 @pytest.mark.unit
+def test_sm120_mxfp8_rejects_gradient_accumulation_fusion(monkeypatch):
+    module = load_arguments_module(monkeypatch)
+    args = types.SimpleNamespace(
+        fp8_quantizer_factory=module._SM120_MXFP8_QUANTIZER_FACTORY,
+        gradient_accumulation_fusion=True,
+        pipeline_model_parallel_size=2,
+    )
+
+    with pytest.raises(ValueError, match="no-gradient-accumulation-fusion"):
+        module.validate_args(args)
+
+
+@pytest.mark.unit
+def test_sm120_mxfp8_allows_unfused_gradient_accumulation(monkeypatch):
+    module = load_arguments_module(monkeypatch)
+    args = types.SimpleNamespace(
+        fp8_quantizer_factory=module._SM120_MXFP8_QUANTIZER_FACTORY,
+        gradient_accumulation_fusion=False,
+        pipeline_model_parallel_size=2,
+    )
+
+    module.validate_args(args)
+
+
+@pytest.mark.unit
 def test_update_weight_disk_dir_required_for_disk_transport(monkeypatch):
     module = load_slime_arguments_module(monkeypatch)
     args = make_slime_validate_args(update_weight_transport="disk", update_weight_disk_dir=None)

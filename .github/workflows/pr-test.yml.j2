@@ -51,6 +51,15 @@
         {'test_file': 'test_qwen3_0.6B_parallel_check.py', 'num_gpus': 8},
       ],
     },
+    'e2e-test-sm120-mxfp8': {
+      'label': 'run-ci-sm120-mxfp8',
+      'runner': '[self-hosted, sm120]',
+      'sm120_preflight': True,
+      'tests': [
+        {'test_file': 'test_sm120_mxfp8_te.py', 'num_gpus': 1},
+        {'test_file': 'test_sm120_mxfp8_megatron_tp.py', 'num_gpus': 2},
+      ],
+    },
     'e2e-test-ckpt': {
       'label': 'run-ci-ckpt',
       'tests': [
@@ -177,7 +186,7 @@ jobs:
 <% if config.get('cpu') %>
     runs-on: ubuntu-latest
 <% else %>
-    runs-on: self-hosted
+    runs-on: << config.get('runner', 'self-hosted') >>
 <% endif %>
     strategy:
       fail-fast: false
@@ -275,7 +284,8 @@ jobs:
             bash -lc '
               set -euo pipefail
               pip install -e . --no-deps --break-system-packages
-              TEST_PATH="$TEST_FILE"
+<% if config.get('sm120_preflight') %>              python -c "import os, torch, torchao, transformer_engine; count = int(os.environ[\"NUM_GPUS\"]); assert torch.cuda.device_count() >= count; assert all(torch.cuda.get_device_capability(i) == (12, 0) for i in range(count))"
+<% endif %>              TEST_PATH="$TEST_FILE"
               if [[ "$TEST_PATH" != tests/* ]]; then
                 TEST_PATH="tests/$TEST_PATH"
               fi

@@ -14,6 +14,8 @@ __all__ = ["validate_args", "megatron_parse_args", "set_default_megatron_args"]
 
 logger = logging.getLogger(__name__)
 
+_SM120_MXFP8_QUANTIZER_FACTORY = "slime.backends.megatron_utils.sm120_mxfp8.quantizer_factory"
+
 
 _ALLGATHER_CP_DSA_ARCHITECTURES = {
     "DeepseekV32ForCausalLM",
@@ -77,6 +79,13 @@ def validate_args(args):
     """Run megatron's own validate_args plus slime-specific megatron validations."""
 
     _megatron_validate_args(args)
+
+    if getattr(args, "fp8_quantizer_factory", None) == _SM120_MXFP8_QUANTIZER_FACTORY and getattr(
+        args, "gradient_accumulation_fusion", False
+    ):
+        raise ValueError(
+            "SM120 MXFP8 does not support --gradient-accumulation-fusion; " "pass --no-gradient-accumulation-fusion"
+        )
 
     # always use varlen
     args.variable_seq_lengths = True

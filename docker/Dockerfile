@@ -11,6 +11,7 @@ ARG DEEPEP_CUDA_ARCH_LIST=
 ARG FLASH_QLA_COMMIT=821fd9d37ede18fdc2a4e707fefe3770bfc32e58
 ARG TRANSFORMER_ENGINE_COMMIT=c9877beb87ad7e711e1869dd0b5062167ede447a
 ARG TRANSFORMER_ENGINE_CUDA_ARCHS=100a;103a
+ARG TORCHAO_VERSION=0.17.0
 ARG TMS_COMMIT=8d30c59ca12a68d9deccbc9c6599076a1218cbc5
 
 ARG TMS_CUDA_MAJOR=
@@ -59,6 +60,8 @@ RUN if [ "$(python -c 'import torch; print(torch.version.cuda.split(".")[0])')" 
     else \
       pip -v install --no-build-isolation "transformer_engine[pytorch]==2.16.1"; \
     fi
+
+RUN pip install "torchao==${TORCHAO_VERSION}"
 
 RUN NVCC_APPEND_FLAGS="--threads 4" \
   pip -v install --disable-pip-version-check --no-cache-dir \
