@@ -1,0 +1,327 @@
+diff --git a/python/sglang/srt/entrypoints/http_server.py b/python/sglang/srt/entrypoints/http_server.py
+index 2c60598d0..077e8da27 100644
+--- a/python/sglang/srt/entrypoints/http_server.py
++++ b/python/sglang/srt/entrypoints/http_server.py
+@@ -1333,7 +1333,9 @@ async def update_weights_from_ipc(
+ 
+ @app.post("/post_process_weights")
+ @auth_level(AuthLevel.ADMIN_OPTIONAL)
+-async def post_process_weights(req: PostProcessWeightsReqInput, request: Request):
++async def post_process_weights(
++    req: Annotated[PostProcessWeightsReqInput, Body()], request: Request
++):
+     """Optional post-processing for updated weights, e.g. quantization packing."""
+     success, message = await _global_state.tokenizer_manager.post_process_weights(
+         req, request
+diff --git a/python/sglang/srt/layers/moe/moe_runner/triton.py b/python/sglang/srt/layers/moe/moe_runner/triton.py
+index 84a9a7910..f6f6d8271 100644
+--- a/python/sglang/srt/layers/moe/moe_runner/triton.py
++++ b/python/sglang/srt/layers/moe/moe_runner/triton.py
+@@ -16,7 +16,7 @@ from sglang.srt.layers.moe.moe_runner.base import (
+     register_pre_permute,
+ )
+ from sglang.srt.layers.moe.utils import MoeRunnerBackend
+-from sglang.srt.utils import is_cuda, is_gfx95_supported, is_hip
++from sglang.srt.utils import is_cuda, is_gfx95_supported, is_hip, is_sm120_supported
+ 
+ if TYPE_CHECKING:
+     from sglang.srt.layers.moe.token_dispatcher.standard import (
+@@ -111,9 +111,36 @@ class TritonRunnerCore(MoeRunnerCore):
+             )
+             return TritonRunnerOutput(hidden_states=out)
+ 
++        if quant_info.use_mxfp8 and is_cuda() and is_sm120_supported():
++            from sglang.srt.layers.moe.moe_runner.triton_utils.mxfp8_moe_sm120 import (
++                fused_experts_mxfp8_sm120,
++            )
++
++            out = fused_experts_mxfp8_sm120(
++                runner_input.hidden_states,
++                quant_info.w13_weight,
++                quant_info.w2_weight,
++                runner_input.topk_weights,
++                runner_input.topk_ids,
++                quant_info.w13_scale,
++                quant_info.w2_scale,
++                b1=quant_info.b13,
++                b2=quant_info.b2,
++                activation=self.config.activation,
++                is_gated=self.config.is_gated,
++                no_combine=self.config.no_combine,
++                inplace=self.config.inplace,
++                apply_router_weight_on_input=self.config.apply_router_weight_on_input,
++                routed_scaling_factor=self.config.routed_scaling_factor,
++                gemm1_alpha=self.config.gemm1_alpha,
++                gemm1_limit=self.config.gemm1_clamp_limit,
++                swiglu_limit=self.config.swiglu_limit,
++            )
++            return TritonRunnerOutput(hidden_states=out)
++
+         if quant_info.use_mxfp8 and is_cuda():
+             raise NotImplementedError(
+-                "Triton MoE runner does not support NVIDIA MXFP8; use "
++                "Triton MoE runner does not support NVIDIA MXFP8 outside SM120; use "
+                 "--moe-runner-backend deep_gemm (or flashinfer_trtllm/cutlass)."
+             )
+ 
+@@ -207,10 +234,36 @@ def fused_experts_none_to_triton(
+             swiglu_limit=runner_config.swiglu_limit,
+             gate_up_interleaved=runner_config.gate_up_interleaved,
+         )
++    elif quant_info.use_mxfp8 and is_cuda() and is_sm120_supported():
++        from sglang.srt.layers.moe.moe_runner.triton_utils.mxfp8_moe_sm120 import (
++            fused_experts_mxfp8_sm120,
++        )
++
++        topk_weights, topk_ids, _ = dispatch_output.topk_output
++        output = fused_experts_mxfp8_sm120(
++            hidden_states=dispatch_output.hidden_states,
++            w1=quant_info.w13_weight,
++            w2=quant_info.w2_weight,
++            topk_weights=topk_weights,
++            topk_ids=topk_ids,
++            w1_scale=quant_info.w13_scale,
++            w2_scale=quant_info.w2_scale,
++            b1=quant_info.b13,
++            b2=quant_info.b2,
++            activation=runner_config.activation,
++            is_gated=runner_config.is_gated,
++            no_combine=runner_config.no_combine,
++            inplace=runner_config.inplace,
++            apply_router_weight_on_input=runner_config.apply_router_weight_on_input,
++            routed_scaling_factor=runner_config.routed_scaling_factor,
++            gemm1_alpha=runner_config.gemm1_alpha,
++            gemm1_limit=runner_config.gemm1_clamp_limit,
++            swiglu_limit=runner_config.swiglu_limit,
++        )
+     else:
+         if quant_info.use_mxfp8 and is_cuda():
+             raise NotImplementedError(
+-                "Triton MoE runner does not support NVIDIA MXFP8; use "
++                "Triton MoE runner does not support NVIDIA MXFP8 outside SM120; use "
+                 "--moe-runner-backend deep_gemm (or flashinfer_trtllm/cutlass)."
+             )
+         from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
+diff --git a/python/sglang/srt/layers/moe/moe_runner/triton_utils/mxfp8_moe_sm120.py b/python/sglang/srt/layers/moe/moe_runner/triton_utils/mxfp8_moe_sm120.py
+new file mode 100644
+index 000000000..674b73618
+--- /dev/null
++++ b/python/sglang/srt/layers/moe/moe_runner/triton_utils/mxfp8_moe_sm120.py
+@@ -0,0 +1,155 @@
++"""Native MXFP8 W8A8 (1x32 block, UE8M0 scale) MoE for NVIDIA SM120/SM121.
++
++None of the NVIDIA MXFP8 MoE backends (cutlass ``es_sm100_*``, FlashInfer
++TRT-LLM, DeepGEMM) run on consumer Blackwell. This path reuses the grouped
++``tl.dot_scaled`` kernel written for AMD gfx950, which lowers to the SM120
++block-scaled MMA: tokens are sorted by expert once, both GEMMs run as a single
++grouped launch over all experts, and activations are MXFP8-quantized on the fly.
++
++Unlike the gfx950 entry (SwiGLU-OAI only), this entry applies the standard
++gated SiLU on the split ``[gate | up]`` layout used by Qwen/DeepSeek-style MoE.
++Weights and scales stay in the canonical layout: ``w [E, N, K]`` fp8 e4m3 and
++``w_scale [E, N, K // 32]`` uint8 UE8M0.
++"""
++
++from __future__ import annotations
++
++from typing import Optional
++
++import torch
++
++from sglang.jit_kernel.activation import silu_and_mul
++from sglang.srt.layers.moe.moe_runner.triton_utils.moe_align_block_size import (
++    moe_align_block_size,
++)
++from sglang.srt.layers.moe.moe_runner.triton_utils.mxfp8_moe_amd_gfx95 import (
++    _combine_topk_routes,
++    _grouped_gemm_mxfp8,
++)
++from sglang.srt.layers.quantization.mxfp8_amd_gfx95 import mxfp8_e4m3_quantize
++
++_BLOCK_M = 64
++
++
++def fused_experts_mxfp8_sm120(
++    hidden_states: torch.Tensor,
++    w1: torch.Tensor,
++    w2: torch.Tensor,
++    topk_weights: torch.Tensor,
++    topk_ids: torch.Tensor,
++    w1_scale: torch.Tensor,
++    w2_scale: torch.Tensor,
++    *,
++    b1: Optional[torch.Tensor] = None,
++    b2: Optional[torch.Tensor] = None,
++    activation: str = "silu",
++    is_gated: bool = True,
++    no_combine: bool = False,
++    inplace: bool = False,
++    apply_router_weight_on_input: bool = False,
++    routed_scaling_factor: Optional[float] = None,
++    gemm1_alpha: Optional[float] = None,
++    gemm1_limit: Optional[float] = None,
++    swiglu_limit: Optional[float] = None,
++    expert_map: Optional[torch.Tensor] = None,
++) -> torch.Tensor:
++    if not (activation == "silu" and is_gated):
++        raise NotImplementedError(
++            f"SM120 MXFP8 MoE only supports gated silu, got {activation=} {is_gated=}."
++        )
++    if b1 is not None or b2 is not None:
++        raise NotImplementedError("SM120 MXFP8 MoE does not support expert bias.")
++    if apply_router_weight_on_input:
++        raise NotImplementedError(
++            "SM120 MXFP8 MoE does not support apply_router_weight_on_input."
++        )
++    if gemm1_alpha is not None or gemm1_limit is not None or swiglu_limit is not None:
++        raise NotImplementedError(
++            "SM120 MXFP8 MoE does not support clamped / SwiGLU-OAI activations."
++        )
++
++    T, H = hidden_states.shape
++    top_k = topk_ids.shape[1]
++    M = T * top_k
++    local_num_experts = w1.shape[0]
++
++    if expert_map is not None:
++        valid_global = (topk_ids >= 0) & (topk_ids < expert_map.numel())
++        topk_ids = expert_map[topk_ids.clamp(0, expert_map.numel() - 1).long()].to(
++            torch.int32
++        )
++        topk_ids.masked_fill_(
++            ~valid_global | (topk_ids < 0) | (topk_ids >= local_num_experts), -1
++        )
++    else:
++        topk_ids = topk_ids.to(torch.int32, copy=True)
++        topk_ids.masked_fill_((topk_ids < 0) | (topk_ids >= local_num_experts), -1)
++
++    sorted_ids, expert_ids, num_post = moe_align_block_size(
++        topk_ids, _BLOCK_M, local_num_experts
++    )
++
++    # GEMM1: hidden states are quantized once; the kernel gathers rows per route.
++    a_q, a_s = mxfp8_e4m3_quantize(hidden_states)
++    gate_up = _grouped_gemm_mxfp8(
++        a_q,
++        a_s,
++        w1,
++        w1_scale,
++        sorted_ids,
++        expert_ids,
++        num_post,
++        M,
++        top_k,
++        _BLOCK_M,
++        hidden_states.dtype,
++        a_div=top_k,
++    )  # [M, 2I]
++
++    act = torch.empty(
++        (M, gate_up.shape[1] // 2), dtype=hidden_states.dtype, device=gate_up.device
++    )
++    silu_and_mul(gate_up, act)
++    act_q, act_s = mxfp8_e4m3_quantize(act)
++
++    if no_combine:
++        down = _grouped_gemm_mxfp8(
++            act_q,
++            act_s,
++            w2,
++            w2_scale,
++            sorted_ids,
++            expert_ids,
++            num_post,
++            M,
++            top_k,
++            _BLOCK_M,
++            hidden_states.dtype,
++            a_div=1,
++        )
++        return down.view(T, top_k, H)
++
++    # GEMM2 applies the top-k weight in the epilogue; routes are summed after.
++    down = _grouped_gemm_mxfp8(
++        act_q,
++        act_s,
++        w2,
++        w2_scale,
++        sorted_ids,
++        expert_ids,
++        num_post,
++        M,
++        top_k,
++        _BLOCK_M,
++        torch.float32,
++        a_div=1,
++        mul_weight_by=topk_weights.reshape(-1).to(torch.float32),
++    )  # [M, H]
++    out = _combine_topk_routes(down, T, top_k, H, hidden_states.dtype)
++
++    if routed_scaling_factor is not None and routed_scaling_factor != 1.0:
++        out.mul_(routed_scaling_factor)
++    if inplace:
++        hidden_states.copy_(out)
++        return hidden_states
++    return out
+diff --git a/python/sglang/srt/layers/quantization/fp8.py b/python/sglang/srt/layers/quantization/fp8.py
+index 151f80e72..5591c1ad8 100644
+--- a/python/sglang/srt/layers/quantization/fp8.py
++++ b/python/sglang/srt/layers/quantization/fp8.py
+@@ -1474,8 +1474,12 @@ class Fp8MoEMethod(FusedMoEMethodBase):
+ 
+     def _process_mxfp8_moe_weights(self, layer: Module, quantize: bool = True) -> None:
+ 
++        if _is_cuda and is_sm120_supported():
++            self._process_mxfp8_moe_weights_sm120(layer, quantize)
++            return
++
+         if not (_is_cuda and is_sm100_supported()):
+-            raise RuntimeError("MXFP8 MoE quantization requires SM100.")
++            raise RuntimeError("MXFP8 MoE quantization requires SM100 or SM120.")
+ 
+         def _quantize_and_swizzle_with_cutlass_es_kernel(weight: torch.Tensor):
+             from sgl_kernel import es_sm100_mxfp8_blockscaled_grouped_quant
+@@ -1650,6 +1654,35 @@ class Fp8MoEMethod(FusedMoEMethodBase):
+ 
+             align_mxfp8_moe_weights_for_flashinfer_trtllm(layer)
+ 
++    def _process_mxfp8_moe_weights_sm120(self, layer: Module, quantize: bool) -> None:
++        # The SM120 grouped dot_scaled kernel consumes the canonical layout
++        # (w [E, N, K] e4m3, scale [E, N, K // 32] UE8M0), so serialized
++        # checkpoints and hot-reloaded weights need no transform. This keeps
++        # repeated post-processing after weight updates idempotent.
++        if quantize:
++            for weight_param, scale_name in [
++                (layer.w13_weight, "w13_weight_scale_inv"),
++                (layer.w2_weight, "w2_weight_scale_inv"),
++            ]:
++                weight = weight_param.data.contiguous()
++                num_experts, n, k = weight.shape
++                qweight, scale = mxfp8_group_quantize(weight.view(-1, k))
++                weight_param.data = qweight.view(num_experts, n, k)
++                scale_param = getattr(layer, scale_name)
++                scale_param.data = scale.view(num_experts, n, k // 32)
++
++        for name in [
++            "w13_weight",
++            "w2_weight",
++            "w13_weight_scale_inv",
++            "w2_weight_scale_inv",
++        ]:
++            getattr(layer, name).requires_grad_(False)
++        layer.w13_weight_scale_inv.format_ue8m0 = True
++        layer.w2_weight_scale_inv.format_ue8m0 = True
++        layer.w13_input_scale = None
++        layer.w2_input_scale = None
++
+     def process_weights_after_loading(self, layer: Module) -> None:
+         if _is_hip and _use_hip_int4:
+             self.process_weights_hip_int4(layer)
+@@ -1904,6 +1937,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
+             a13_scale=layer.w13_input_scale,
+             a2_scale=layer.w2_input_scale,
+             block_shape=self.quant_config.weight_block_size,
++            use_mxfp8=self.use_mxfp8,
+         )
+ 
+     def apply(

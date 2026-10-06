@@ -1,5 +1,5 @@
 """
-python tools/convert_hf_to_fp8.py [-h] [--model-dir MODEL_DIR] [--save-dir SAVE_DIR] [--strategy {block,channel,tensor}] [--block-size [BLOCK_SIZE ...]]
+python tools/convert_hf_to_fp8.py [-h] [--model-dir MODEL_DIR] [--save-dir SAVE_DIR] [--strategy {block,channel,tensor,mxfp8}] [--block-size [BLOCK_SIZE ...]]
                            [--max-workers MAX_WORKERS]
 
 options:
@@ -7,7 +7,8 @@ options:
   --model-dir MODEL_DIR
                         Path to the directory of the HF safetensors model.
   --save-dir SAVE_DIR   Path to the directory to save the converted model.
-  --strategy {block,channel,tensor}
+  --strategy {block,channel,tensor,mxfp8}
+                        mxfp8: OCP MX FP8 (e4m3 + UE8M0 scale per 1x32 block); linear attention stays BF16.
   --block-size [BLOCK_SIZE ...]
                         eg. --block-size 32 32
   --max-workers MAX_WORKERS
@@ -91,13 +92,67 @@ def tensor_fp8(weight):
     return qweight, scale
 
 
+def mxfp8(weight):
+    # Same quantizer slime uses when syncing MXFP8 weights to SGLang, so offline
+    # checkpoints and hot-updated weights are bitwise identical.
+    from sglang.srt.layers.quantization.fp8_utils import mxfp8_group_quantize
+
+    return mxfp8_group_quantize(weight.contiguous())
+
+
 def quant_fp8(weight, strategy, block_size=None):
     if strategy == "tensor":
         return tensor_fp8(weight)
     elif strategy == "channel":
         return channel_fp8(weight)
+    elif strategy == "mxfp8":
+        return mxfp8(weight)
     else:
         return block_fp8(weight, block_size)
+
+
+def split_fused_experts(weights):
+    """Split fused 3D expert tensors (e.g. Qwen3.5 BF16 ``mlp.experts.gate_up_proj``) into
+    per-expert 2D ``.weight`` tensors, the layout of the official FP8 checkpoints."""
+    split = {}
+    for key, value in weights.items():
+        if key.endswith(".mlp.experts.gate_up_proj"):
+            prefix = key.removesuffix("gate_up_proj")
+            for expert_idx, gate_up in enumerate(value):
+                gate, up = gate_up.chunk(2, dim=0)
+                split[f"{prefix}{expert_idx}.gate_proj.weight"] = gate.contiguous()
+                split[f"{prefix}{expert_idx}.up_proj.weight"] = up.contiguous()
+        elif key.endswith(".mlp.experts.down_proj"):
+            prefix = key.removesuffix("down_proj")
+            for expert_idx, down in enumerate(value):
+                split[f"{prefix}{expert_idx}.down_proj.weight"] = down.contiguous()
+        else:
+            split[key] = value
+    return split
+
+
+def should_quantize(key, strategy):
+    # MXFP8 keeps exactly the layers slime's MXFP8 weight sync keeps in BF16.
+    if strategy == "mxfp8" and any(skip in key for skip in ("linear_attn", "visual", "mtp.fc")):
+        return False
+    return (
+        "weight" in key
+        and "layernorm" not in key
+        and "embed" not in key
+        and "router" not in key
+        and "mlp.gate." not in key
+        # [1, hidden] gate kept unquantized by SGLang; an FP8 copy is loaded without its scale.
+        and "shared_expert_gate" not in key
+        and "norm" not in key
+        and "lm_head" not in key
+        and "eh_proj" not in key
+        and "weights_proj" not in key
+        and "conv1d" not in key
+        and "A_log" not in key
+        and "dt_bias" not in key
+        and "in_proj_a" not in key
+        and "in_proj_b" not in key
+    )
 
 
 class ConversionResult:
@@ -128,28 +183,14 @@ def process_file(input_path, output_path, filename, strategy, block_size, result
     ) as f:
         for k in f.keys():
             weights[k] = f.get_tensor(k)
+    weights = split_fused_experts(weights)
 
     modules_to_not_convert = []
     for key in weights.keys():
-        if (
-            "weight" in key
-            and "layernorm" not in key
-            and "embed" not in key
-            and "router" not in key
-            and "mlp.gate." not in key
-            and "norm" not in key
-            and "lm_head" not in key
-            and "eh_proj" not in key
-            and "weights_proj" not in key
-            and "conv1d" not in key
-            and "A_log" not in key
-            and "dt_bias" not in key
-            and "in_proj_a" not in key
-            and "in_proj_b" not in key
-        ):
+        if should_quantize(key, strategy):
             qw, s = quant_fp8(weights[key], strategy, block_size)
             q_weights[key] = qw
-            if block_size:
+            if block_size or strategy == "mxfp8":
                 scale_name = key.replace(".weight", ".weight_scale_inv")
             else:
                 scale_name = key.replace(".weight", ".weight_scale")
@@ -186,7 +227,14 @@ def convert_fp8(input_path, output_path, strategy, block_size=None, max_workers=
         for future in tqdm(futures, desc="Processing files"):
             future.result()
 
-    if strategy == "block" or strategy == "tensor":
+    if strategy == "mxfp8":
+        quantization_config = {
+            "activation_scheme": "dynamic",
+            "quant_method": "mxfp8",
+            "weight_block_size": [1, 32],
+            "ignored_layers": sorted(set(result_collector.modules_to_not_convert)),
+        }
+    elif strategy == "block" or strategy == "tensor":
         quantization_config = {
             "activation_scheme": "dynamic",
             "fmt": "e4m3",
@@ -254,7 +302,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-dir", type=str, help="Path to the directory of the HF safetensors model.")
     parser.add_argument("--save-dir", type=str, help="Path to the directory to save the converted model.")
-    parser.add_argument("--strategy", type=str, default="block", choices=["block", "channel", "tensor"])
+    parser.add_argument("--strategy", type=str, default="block", choices=["block", "channel", "tensor", "mxfp8"])
     parser.add_argument("--block-size", type=int, nargs="*", default=None, help="eg. --block-size 128 128")
     parser.add_argument("--max-workers", type=int, default=1, help="Number of worker threads for parallel processing")
     parser.add_argument("--scale-fmt", type=str, default=None, choices=["ue8m0"])

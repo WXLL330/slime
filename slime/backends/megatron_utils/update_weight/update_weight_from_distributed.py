@@ -124,8 +124,7 @@ class UpdateWeightFromDistributed:
         self._send_weights(pbar)
 
         if dist.get_rank() == 0:
-            # int4/fp4 post_process
-            if self.quantization_config and self.quantization_config["quant_method"] in ["compressed-tensors"]:
+            if requires_post_process_after_update(self.quantization_config):
                 post_process_weights(
                     restore_weights_before_load=False,
                     post_process_quantization=True,
@@ -354,6 +353,15 @@ def update_weights_from_distributed(
         handle.wait()
 
     return refs
+
+
+def requires_post_process_after_update(quantization_config: dict | None) -> bool:
+    """Whether rollout engines must re-run quantization post-processing after a weight update.
+
+    int4 (compressed-tensors) repacks weights, and MXFP8 rebuilds backend-specific scale layouts
+    (e.g. FlashInfer swizzled scales) from the freshly loaded canonical weights and scales.
+    """
+    return quantization_config is not None and quantization_config["quant_method"] in ["compressed-tensors", "mxfp8"]
 
 
 def post_process_weights(
