@@ -120,6 +120,17 @@ E4M3 是浮点格式，scale 改变 2 的整数次幂时，元素的相对舍入
 
 结论：microxcaling 实现的是 OCP 规范里“floor 取 scale + 饱和”的变体，与 TE 的“向上取整、不截断”不同，所以不能作为 TE 的逐位参考，只能用于理解 shared exponent 和舍入的概念。
 
+## TE 官方数值测试（v2.16 `tests/pytorch/test_numerics.py`）
+
+- 获取方式：git 访问 GitHub 超时，但 `curl https://raw.githubusercontent.com/...` 可用，偶发 `curl: (56)` 时重试即可。`test_numerics.py` 和 `utils.py` 下载到 scratchpad 的 `te_tests/`，用一个 `conftest.py` 在收集用例前调用 `apply_sm120_mxfp8_patch()`，这样 `is_mxfp8_available()` 返回 True，`recipe0` 即为 `MXFP8BlockScaling`。
+- 命令：`CUDA_VISIBLE_DEVICES=0 python -m pytest test_numerics.py -k "recipe0 or mxfp8" -o addopts=""`
+- 结果：262 个通过，144 个跳过，48 个失败，共 49.6 秒。
+  - 通过：打过补丁的模块全部通过，包括 `test_grouped_linear_accuracy`（192 个，GroupedLinear 与逐专家 `te.Linear` 对比，其中一部分要求 atol=0 逐位一致）、`test_padding_grouped_linear_accuracy`、`*_save_original_input`、`test_grouped_linear_accuracy_single_gemm`。
+  - 跳过：`test_grouped_gemm_grouped_tensor_mxfp8` 共 144 个，需要 cuBLAS 13 的分组 GEMM。
+  - 失败 1：42 个 GPT 整模型用例（`test_gpt_selective_activation_recompute`、`test_gpt_full_activation_recompute`、`test_gpt_fp8_parameters`）全部出自 `layernorm_mlp.py:1220` 的反向，报 `CUBLAS_STATUS_NOT_SUPPORTED`。原因是补丁没有覆盖 `LayerNormMLP`，属于预期内的失败。
+  - 失败 2：6 个 `test_grouped_gemm_grouped_tensor_zero_work`，报 `nvte_get_grouped_gemm_setup_workspace_size requires cuBLAS 13`。这是 GroupedTensor 分组 GEMM 新接口，TE 2.16 的 `GroupedLinear` 模块默认不走它，补丁也没有覆盖。
+- 仅在 scratch 中做的实验：给 `layernorm_mlp.general_gemm` 也打上同样的补丁后，GPT 相关 MXFP8 用例 78 个全部通过，用时 11.6 秒，覆盖了 selective 和 full activation recompute 的前后一致性，以及以 MXFP8 存储的模型参数。说明转置方案在完整的 TransformerLayer 和 recompute 路径中同样成立。没有把这一点写进 `sm120_mxfp8.py`，因为 Megatron 默认的 TE spec 不用 `LayerNormMLP`，任务也限定只改三个模块。如果阶段二需要，只要多加一行赋值。
+
 ## CI
 
 - 文件头设置了 `NUM_GPUS = 1`。测试仅在 SM100（验证 TE 原生 MXFP8）和 SM120（验证 slime 补丁）上运行，其他硬件上全部跳过。
