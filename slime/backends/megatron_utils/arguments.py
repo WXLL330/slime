@@ -87,6 +87,14 @@ def validate_args(args):
         )
         args.moe_token_dispatcher_type = "alltoall"
 
+    # MXFP8 scales 32-token blocks of activations, so every SP/CP rank needs a multiple of 32 tokens;
+    # slime pads each micro batch to TP * data_pad_size_multiplier tokens per CP rank.
+    if args.fp8 and args.fp8_recipe == "mxfp8" and args.data_pad_size_multiplier % 32 != 0:
+        raise ValueError(
+            f"--fp8-recipe mxfp8 requires --data-pad-size-multiplier to be a multiple of 32, "
+            f"got {args.data_pad_size_multiplier}."
+        )
+
     if args.pipeline_model_parallel_size == 1:
         assert args.decoder_first_pipeline_num_layers is None and args.decoder_last_pipeline_num_layers is None, (
             "decoder_first_pipeline_num_layers and decoder_last_pipeline_num_layers should be None when "

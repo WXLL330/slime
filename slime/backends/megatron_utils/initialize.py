@@ -59,6 +59,18 @@ def init(args):
         logger.info("Enable megatron experimental")
         set_experimental_flag(True)
 
+    # TE disables MXFP8 on SM12x; the patch has to be in place before any TE module is built.
+    if args.fp8 and args.fp8_recipe == "mxfp8" and torch.cuda.get_device_capability() >= (12, 0):
+        if args.fp8_param_gather:
+            raise ValueError(
+                "--fp8-param-gather is not supported with --fp8-recipe mxfp8 on SM12x GPUs: the SM120 GEMM "
+                "patch and slime's MXFP8 weight sync are only verified with BF16 model parameters."
+            )
+        from .sm120_mxfp8 import apply_sm120_mxfp8_patch
+
+        apply_sm120_mxfp8_patch()
+        logger.info("Applied the SM120 MXFP8 patch to Transformer Engine")
+
     # Pytorch distributed.
     _initialize_distributed(args)
 

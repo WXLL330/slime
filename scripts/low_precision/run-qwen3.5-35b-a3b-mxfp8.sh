@@ -1,36 +1,41 @@
 #!/bin/bash
 
-# BF16 training + MXFP8 W8A8 rollout (SGLang) GRPO for Qwen3.5-35B-A3B on a single 8-GPU node.
+# MXFP8 W8A8 rollout (SGLang) GRPO for Qwen3.5-35B-A3B on a single 8-GPU node, with optional
+# MXFP8 W8A8 training (Transformer Engine MXFP8BlockScaling).
 #
-# Rollout runs MXFP8 (e4m3 weights/activations, UE8M0 scale per 1x32 block) for full attention,
-# shared experts and routed experts; linear attention, routers, gates, embeddings and lm_head stay
-# BF16 because they are plain BF16 layers in training. slime re-quantizes the BF16 training weights
-# with the same quantizer on every weight sync.
+# Rollout runs MXFP8 (e4m3 weights/activations, UE8M0 scale per 1x32 block) on the same layers as the
+# official Qwen3.5 FP8 checkpoints: full attention, linear-attention in_proj_qkv/in_proj_z/out_proj,
+# shared experts and routed experts. Linear-attention in_proj_a/in_proj_b/conv1d, routers, gates,
+# embeddings and lm_head stay BF16. slime re-quantizes the BF16 training weights with the same
+# quantizer on every weight sync.
 #
-# On SM120 (RTX PRO 6000 / RTX 50) SGLang needs docker/patch/latest/sglang-sm120-mxfp8.patch, which
-# adds a grouped MXFP8 MoE kernel; the Triton MoE runner is used and both GEMMs stay MXFP8.
+# TRAIN_MXFP8=1 also trains with MXFP8 (--fp8-format e4m3 --fp8-recipe mxfp8) on the same layers, so
+# training and rollout quantize identically; TRAIN_MXFP8=0 trains in BF16.
 #
-# Before the first run:
-#   1. Build the MXFP8 HF checkpoint that SGLang starts from (its quantization_config drives the sync):
-#        python tools/convert_hf_to_fp8.py --strategy mxfp8 \
-#            --model-dir /workspace/hf_models/Qwen3.5-35B-A3B \
-#            --save-dir /workspace/hf_models/Qwen3.5-35B-A3B-MXFP8-slime
-#   2. Convert the BF16 HF checkpoint to torch_dist for Megatron:
-#        source scripts/models/qwen3.5-35B-A3B.sh
-#        PYTHONPATH=/root/Megatron-LM torchrun --nproc-per-node 8 tools/convert_hf_to_torch_dist.py \
-#            ${MODEL_ARGS[@]} \
-#            --hf-checkpoint /workspace/hf_models/Qwen3.5-35B-A3B \
-#            --save /workspace/rl-project/slime_dev/slime/mg_models/qwen3.5-35b-a3b-mg
+# On SM120 (RTX PRO 6000 / RTX 50):
+#   - SGLang needs docker/patch/latest/sglang-sm120-mxfp8.patch (grouped MXFP8 MoE kernel in the
+#     Triton MoE runner).
+#   - slime patches TE at startup so its MXFP8 backward GEMMs run on SM120
+#     (slime/backends/megatron_utils/sm120_mxfp8.py).
+#
+# Before the first run, build the MXFP8 HF checkpoint that SGLang starts from (its quantization_config
+# drives the MXFP8 weight sync):
+#   python tools/convert_hf_to_fp8.py --strategy mxfp8 \
+#       --model-dir /workspace/hf_models/Qwen3.5-35B-A3B \
+#       --save-dir /workspace/hf_models/Qwen3.5-35B-A3B-MXFP8-slime-v2
+# Megatron loads the BF16 HF checkpoint directly (a torch_dist checkpoint works as well).
 
-# for rerun the task
-pkill -9 sglang
-sleep 3
-ray stop --force
-pkill -9 ray
-pkill -9 python
-sleep 3
-pkill -9 ray
-pkill -9 python
+TRAIN_MXFP8=${TRAIN_MXFP8:-1}
+BF16_HF_CKPT=${BF16_HF_CKPT:-/workspace/hf_models/Qwen3.5-35B-A3B}
+MXFP8_HF_CKPT=${MXFP8_HF_CKPT:-/workspace/hf_models/Qwen3.5-35B-A3B-MXFP8-slime-v2}
+SAVE_PATH=${SAVE_PATH:-./ckpt/qwen3.5-35b-a3b-mxfp8-dapo-math-17k}
+SAVE_INTERVAL=${SAVE_INTERVAL:-20}  # 0 disables checkpointing
+NUM_ROLLOUT=${NUM_ROLLOUT:-200}
+ROLLOUT_BATCH_SIZE=${ROLLOUT_BATCH_SIZE:-16}
+N_SAMPLES_PER_PROMPT=${N_SAMPLES_PER_PROMPT:-8}
+ROLLOUT_MAX_RESPONSE_LEN=${ROLLOUT_MAX_RESPONSE_LEN:-8192}
+GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE:-128}
+RUN_EVAL=${RUN_EVAL:-1}
 
 set -ex
 
@@ -50,14 +55,18 @@ source "${SCRIPT_DIR}/../models/qwen3.5-35B-A3B.sh"
 
 CKPT_ARGS=(
    # MXFP8 HF checkpoint: SGLang loads it and its quantization_config drives MXFP8 weight sync
-   --hf-checkpoint /workspace/hf_models/Qwen3.5-35B-A3B-MXFP8-slime
-   # torch_dist converted from the BF16 Qwen3.5-35B-A3B checkpoint
-   --ref-load /workspace/rl-project/slime_dev/slime/mg_models/qwen3.5-35b-a3b-mg
-   # --load ./ckpt/qwen3.5-35b-a3b-mxfp8-dapo-math-17k
-   --save ./ckpt/qwen3.5-35b-a3b-mxfp8-dapo-math-17k
-   --save-interval 20
-   --save-retain-interval 100
+   --hf-checkpoint "${MXFP8_HF_CKPT}"
+   # BF16 weights for Megatron (HF checkpoint loaded directly)
+   --load "${BF16_HF_CKPT}"
+   --ref-load "${BF16_HF_CKPT}"
 )
+if [ "${SAVE_INTERVAL}" != "0" ]; then
+   CKPT_ARGS+=(
+      --save "${SAVE_PATH}"
+      --save-interval "${SAVE_INTERVAL}"
+      --save-retain-interval 100
+   )
+fi
 
 ROLLOUT_ARGS=(
    --prompt-data /workspace/datasets/dapo-math-17k-processed/dapo-math-17k.parquet
@@ -66,24 +75,27 @@ ROLLOUT_ARGS=(
    --apply-chat-template
    --rollout-shuffle
    --rm-type deepscaler
-   --num-rollout 200
-   --rollout-batch-size 16
-   --n-samples-per-prompt 8
-   --rollout-max-response-len 8192
+   --num-rollout "${NUM_ROLLOUT}"
+   --rollout-batch-size "${ROLLOUT_BATCH_SIZE}"
+   --n-samples-per-prompt "${N_SAMPLES_PER_PROMPT}"
+   --rollout-max-response-len "${ROLLOUT_MAX_RESPONSE_LEN}"
    --rollout-temperature 1
 
-   --global-batch-size 128
+   --global-batch-size "${GLOBAL_BATCH_SIZE}"
    --balance-data
 )
 
-EVAL_ARGS=(
-   --eval-interval 20
-   --eval-prompt-data aime /workspace/datasets/aime-2024-processed/aime-2024.parquet
-   --n-samples-per-eval-prompt 4
-   --log-passrate
-   --eval-max-response-len 16384
-   --eval-top-p 1
-)
+EVAL_ARGS=()
+if [ "${RUN_EVAL}" = "1" ]; then
+   EVAL_ARGS=(
+      --eval-interval 20
+      --eval-prompt-data aime /workspace/datasets/aime-2024-processed/aime-2024.parquet
+      --n-samples-per-eval-prompt 4
+      --log-passrate
+      --eval-max-response-len 16384
+      --eval-top-p 1
+   )
+fi
 
 PERF_ARGS=(
    # num_query_groups=2, so TP must be <= 2
@@ -102,10 +114,15 @@ PERF_ARGS=(
    --use-dynamic-batch-size
    --max-tokens-per-gpu 16384
 
-   # training stays BF16 in this stage; MXFP8 training is stage 2
    --transformer-impl transformer_engine
    --bf16
 )
+if [ "${TRAIN_MXFP8}" = "1" ]; then
+   PERF_ARGS+=(
+      --fp8-format e4m3
+      --fp8-recipe mxfp8
+   )
+fi
 
 GRPO_ARGS=(
    --advantage-estimator grpo

@@ -3,6 +3,7 @@ import copy
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from megatron.core.extensions.transformer_engine import TELinear
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import get_num_layers_to_build
@@ -27,15 +28,51 @@ def _get_text_config(hf_config):
     return hf_config
 
 
+def _duplicated_te_linear(input_size, output_size, mcore_config, init_method):
+    linear = TELinear(
+        input_size,
+        output_size,
+        parallel_mode="duplicated",
+        config=mcore_config,
+        init_method=init_method,
+        bias=False,
+        skip_bias_add=False,
+        skip_weight_param_allocation=False,
+    )
+    # The GatedDeltaNet runs on the full sequence on every TP rank, so these weight
+    # gradients are already identical across TP. TELinear's duplicated mode marks them
+    # for the sequence-parallel TP all-reduce, which would sum TP identical copies.
+    for param in linear.parameters():
+        param.sequence_parallel = False
+    # Keep the checkpoint layout of the former nn.Linear: torch_dist checkpoints saved before
+    # these projections became TE linears have no `_extra_state`, and Megatron cannot load a
+    # checkpoint that lacks a requested entry. The extra state only holds delayed-scaling FP8
+    # metadata, which the MXFP8/blockwise/current-scaling recipes do not use.
+    linear.register_state_dict_post_hook(_drop_extra_state)
+    linear.register_load_state_dict_pre_hook(_default_extra_state)
+    return linear
+
+
+def _drop_extra_state(module, state_dict, prefix, local_metadata):
+    state_dict.pop(f"{prefix}_extra_state", None)
+
+
+def _default_extra_state(module, state_dict, prefix, *args):
+    state_dict.setdefault(f"{prefix}_extra_state", None)
+
+
 # Adapted from Qwen3NextGatedDeltaNet but with separate in_proj_qkv and in_proj_z
 class Qwen3_5GatedDeltaNet(nn.Module):
     """
     Qwen3.5 GatedDeltaNet with varlen support.
     Unlike Qwen3Next which uses a combined in_proj_qkvz, Qwen3.5 uses
     separate in_proj_qkv (for Q,K,V) and in_proj_z (for Z).
+
+    in_proj_qkv, in_proj_z and out_proj are Transformer Engine linears so that FP8/MXFP8
+    training quantizes them like the rollout engine does; in_proj_b/in_proj_a stay BF16.
     """
 
-    def __init__(self, config, layer_idx: int, args=None):
+    def __init__(self, config, layer_idx: int, mcore_config, args=None):
         super().__init__()
         self.gdn_backend = getattr(args, "qwen_gdn_backend", "fla")
         self.chunk_gated_delta_rule = get_chunk_gated_delta_rule(self.gdn_backend)
@@ -64,8 +101,12 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         # Separate projections for QKV and Z (unlike Qwen3Next which combines QKVZ)
         projection_size_qkv = self.key_dim * 2 + self.value_dim
         projection_size_z = self.value_dim
-        self.in_proj_qkv = nn.Linear(self.hidden_size, projection_size_qkv, bias=False)
-        self.in_proj_z = nn.Linear(self.hidden_size, projection_size_z, bias=False)
+        self.in_proj_qkv = _duplicated_te_linear(
+            self.hidden_size, projection_size_qkv, mcore_config, mcore_config.init_method
+        )
+        self.in_proj_z = _duplicated_te_linear(
+            self.hidden_size, projection_size_z, mcore_config, mcore_config.init_method
+        )
         self.in_proj_b = nn.Linear(self.hidden_size, self.num_v_heads, bias=False)
         self.in_proj_a = nn.Linear(self.hidden_size, self.num_v_heads, bias=False)
 
@@ -83,7 +124,9 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             dtype=config.dtype if config.dtype is not None else torch.get_default_dtype(),
         )
 
-        self.out_proj = nn.Linear(self.value_dim, self.hidden_size, bias=False)
+        self.out_proj = _duplicated_te_linear(
+            self.value_dim, self.hidden_size, mcore_config, mcore_config.output_layer_init_method
+        )
 
     def forward(
         self,
@@ -93,8 +136,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         batch_size, seq_len, _ = hidden_states.shape
 
         # Projections (flat layout: [Q_all, K_all, V_all])
-        mixed_qkv = self.in_proj_qkv(hidden_states)
-        z = self.in_proj_z(hidden_states)
+        mixed_qkv, _ = self.in_proj_qkv(hidden_states)
+        z, _ = self.in_proj_z(hidden_states)
         z = z.reshape(batch_size, seq_len, -1, self.head_v_dim)
         b = self.in_proj_b(hidden_states)
         a = self.in_proj_a(hidden_states)
@@ -149,7 +192,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         core_attn_out = core_attn_out.reshape(z_shape_og)
         core_attn_out = core_attn_out.reshape(batch_size, seq_len, -1)
 
-        output = self.out_proj(core_attn_out)
+        output, _ = self.out_proj(core_attn_out)
         return output
 
 
@@ -174,7 +217,7 @@ class Attention(HuggingfaceAttention):
         self.hf_config = _get_text_config(self.hf_config)
         self.hf_config._attn_implementation = "flash_attention_2"
 
-        self.linear_attn = Qwen3_5GatedDeltaNet(self.hf_config, self.hf_layer_idx, args=args)
+        self.linear_attn = Qwen3_5GatedDeltaNet(self.hf_config, self.hf_layer_idx, self.config, args=args)
 
         # Use a simple RMSNorm
         try:

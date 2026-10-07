@@ -416,5 +416,62 @@ def test_grouped_linear_matches_emulation(dtype):
         assert _row_rel_err(weight.grad, ref_dw) <= tol
 
 
+# Megatron builds TE linears with fuse_wgrad_accumulation=gradient_accumulation_fusion (on by
+# default): the wgrad GEMM accumulates straight into the FP32 ``main_grad`` buffer.
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
+def test_linear_main_grad_accumulation_and_bias(dtype):
+    m, k, n = 4064, 2048, 1024
+    linear = te.Linear(k, n, bias=True, params_dtype=dtype, fuse_wgrad_accumulation=True).cuda()
+    with torch.no_grad():
+        linear.weight.copy_(_data(n, k, 0.02, 1, seed=70, factor=2.0**6))
+        linear.bias.copy_(_data(1, n, 0.1, None, seed=71, dtype=dtype)[0])
+    main_grad = _data(n, k, 1e-2, None, seed=72, dtype=torch.float32)
+    linear.weight.main_grad = main_grad.clone()
+    x = _data(m, k, 1.0, 1, seed=73, factor=2.0**6, dtype=dtype).requires_grad_()
+    dy = _data(m, n, 1e-3, None, seed=74, dtype=dtype)
+
+    y = _run_te(linear, (x,), dy)
+
+    ref_y, ref_dx, ref_dw = _linear_reference(x.detach(), linear.weight.detach(), dy)
+    tol = _module_tol(dtype)
+    assert _row_rel_err(y, ref_y + linear.bias.detach().double()) <= tol
+    assert _row_rel_err(x.grad, ref_dx) <= tol
+    # The accumulation into main_grad happens inside the FP32 GEMM epilogue for every dtype.
+    assert _row_rel_err(linear.weight.main_grad, main_grad.double() + ref_dw) <= GEMM_TOL
+    assert _row_rel_err(linear.bias.grad[None], dy.double().sum(0)[None]) <= tol
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
+def test_grouped_linear_main_grad_accumulation(dtype):
+    k, n = 2048, 1024
+    m_splits = [96, 0, 32, 160]
+    num_experts = len(m_splits)
+    module = te.GroupedLinear(num_experts, k, n, bias=False, params_dtype=dtype, fuse_wgrad_accumulation=True).cuda()
+    weights = [getattr(module, f"weight{i}") for i in range(num_experts)]
+    main_grads = []
+    with torch.no_grad():
+        for i, weight in enumerate(weights):
+            weight.copy_(_data(n, k, 0.02, 1, seed=80 + i, factor=2.0**6))
+            main_grads.append(_data(n, k, 1e-2, None, seed=90 + i, dtype=torch.float32))
+            weight.main_grad = main_grads[-1].clone()
+    x = _data(sum(m_splits), k, 1.0, 1, seed=99, factor=2.0**6, dtype=dtype).requires_grad_()
+    dy = _data(sum(m_splits), n, 1e-3, None, seed=100, dtype=dtype)
+
+    _run_te(module, (x, m_splits), dy)
+
+    start = 0
+    for weight, main_grad, count in zip(weights, main_grads, m_splits, strict=True):
+        end = start + count
+        if count == 0:
+            assert torch.equal(weight.main_grad, main_grad)
+        else:
+            _, ref_dx, ref_dw = _linear_reference(x.detach()[start:end], weight.detach(), dy[start:end])
+            assert _row_rel_err(weight.main_grad, main_grad.double() + ref_dw) <= GEMM_TOL
+            assert _row_rel_err(x.grad[start:end], ref_dx) <= _module_tol(dtype)
+        start = end
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__]))

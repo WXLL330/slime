@@ -8,7 +8,7 @@ options:
                         Path to the directory of the HF safetensors model.
   --save-dir SAVE_DIR   Path to the directory to save the converted model.
   --strategy {block,channel,tensor,mxfp8}
-                        mxfp8: OCP MX FP8 (e4m3 + UE8M0 scale per 1x32 block); linear attention stays BF16.
+                        mxfp8: OCP MX FP8 (e4m3 + UE8M0 scale per 1x32 block).
   --block-size [BLOCK_SIZE ...]
                         eg. --block-size 32 32
   --max-workers MAX_WORKERS
@@ -133,7 +133,7 @@ def split_fused_experts(weights):
 
 def should_quantize(key, strategy):
     # MXFP8 keeps exactly the layers slime's MXFP8 weight sync keeps in BF16.
-    if strategy == "mxfp8" and any(skip in key for skip in ("linear_attn", "visual", "mtp.fc")):
+    if strategy == "mxfp8" and any(skip in key for skip in ("visual", "mtp.fc")):
         return False
     return (
         "weight" in key

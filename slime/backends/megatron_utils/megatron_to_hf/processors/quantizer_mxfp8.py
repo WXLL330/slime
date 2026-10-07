@@ -2,12 +2,14 @@ import re
 
 from ...sglang import mxfp8_group_quantize
 
-# Linear-attention projections (e.g. Qwen3.5 GatedDeltaNet) run as plain BF16
-# nn.Linear in training, so they stay BF16 for rollout as well and must be
-# listed in the checkpoint's `ignored_layers`.
+# Same scope as the official Qwen3.5 FP8 checkpoints: linear-attention in_proj_a/in_proj_b,
+# conv1d, routers and shared_expert_gate stay BF16 and are listed in `ignored_layers`.
 _QUANTIZED_DENSE_PARAMS = {
     "self_attention.linear_proj.weight",
     "self_attention.linear_qkv.weight",
+    "self_attention.linear_attn.in_proj_qkv.weight",
+    "self_attention.linear_attn.in_proj_z.weight",
+    "self_attention.linear_attn.out_proj.weight",
     "mlp.linear_fc1.weight",
     "mlp.linear_fc2.weight",
 }

@@ -1,9 +1,11 @@
 """CPU tests for MXFP8 rollout weight sync.
 
 Pins two contracts:
-- ``quantize_params`` with ``quant_method == "mxfp8"`` quantizes exactly the
-  attention/MLP/expert projections and keeps linear attention, routers and
-  gates in BF16, emitting ``weight`` + ``weight_scale_inv`` pairs.
+- ``quantize_params`` with ``quant_method == "mxfp8"`` quantizes the same layers
+  as the official Qwen3.5 FP8 checkpoints (attention, linear-attention
+  in_proj_qkv/in_proj_z/out_proj, MLP and expert projections) and keeps
+  in_proj_a/in_proj_b, routers and gates in BF16, emitting ``weight`` +
+  ``weight_scale_inv`` pairs.
 - ``tools/convert_hf_to_fp8.py --strategy mxfp8`` quantizes the same HF tensors,
   so the checkpoint SGLang starts from and the weights slime pushes later agree
   on which modules are MXFP8 (SGLang's ``ignored_layers`` comes from the tool).
@@ -84,11 +86,11 @@ PARAMS = [
     ("module.module.decoder.layers.0.mlp.shared_experts.linear_fc2.weight", (64, 32), True),
     ("module.module.decoder.layers.0.mlp.shared_experts.gate_weight", (1, 64), False),
     ("module.module.decoder.layers.0.mlp.router.weight", (8, 64), False),
-    ("module.module.decoder.layers.0.self_attention.linear_attn.in_proj_qkv.weight", (96, 64), False),
-    ("module.module.decoder.layers.0.self_attention.linear_attn.in_proj_z.weight", (64, 64), False),
+    ("module.module.decoder.layers.0.self_attention.linear_attn.in_proj_qkv.weight", (96, 64), True),
+    ("module.module.decoder.layers.0.self_attention.linear_attn.in_proj_z.weight", (64, 64), True),
     ("module.module.decoder.layers.0.self_attention.linear_attn.in_proj_b.weight", (4, 64), False),
     ("module.module.decoder.layers.0.self_attention.linear_attn.in_proj_a.weight", (4, 64), False),
-    ("module.module.decoder.layers.0.self_attention.linear_attn.out_proj.weight", (64, 64), False),
+    ("module.module.decoder.layers.0.self_attention.linear_attn.out_proj.weight", (64, 64), True),
     ("module.module.mtp.layers.0.transformer_layer.mlp.experts.linear_fc2.weight1", (64, 32), True),
     ("module.module.mtp.layers.0.eh_proj.weight", (64, 128), False),
     ("module.module.output_layer.weight", (64, 64), False),

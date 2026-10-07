@@ -16,6 +16,8 @@ def install_megatron_stubs() -> None:
 
     megatron_mod = types.ModuleType("megatron")
     core_mod = types.ModuleType("megatron.core")
+    extensions_mod = types.ModuleType("megatron.core.extensions")
+    transformer_engine_mod = types.ModuleType("megatron.core.extensions.transformer_engine")
     models_mod = types.ModuleType("megatron.core.models")
     gpt_mod = types.ModuleType("megatron.core.models.gpt")
     gpt_layer_specs_mod = types.ModuleType("megatron.core.models.gpt.gpt_layer_specs")
@@ -38,6 +40,13 @@ def install_megatron_stubs() -> None:
             super().__init__()
             self.config = config
 
+    class TELinear(nn.Linear):
+        def __init__(self, input_size, output_size, *, bias, **kwargs):
+            super().__init__(input_size, output_size, bias=bias)
+
+        def forward(self, x):
+            return super().forward(x), None
+
     class ModuleSpec:
         def __init__(self, module=None, params=None):
             self.module = module
@@ -54,6 +63,7 @@ def install_megatron_stubs() -> None:
         scatter_to_sequence_parallel_region=lambda x, group=None: x,
     )
 
+    transformer_engine_mod.TELinear = TELinear
     gpt_layer_specs_mod.get_gpt_decoder_block_spec = lambda *args, **kwargs: None
     inference_contexts_mod.BaseInferenceContext = type("BaseInferenceContext", (), {})
     packed_seq_mod.PackedSeqParams = PackedSeqParams
@@ -67,6 +77,8 @@ def install_megatron_stubs() -> None:
 
     sys.modules["megatron"] = megatron_mod
     sys.modules["megatron.core"] = core_mod
+    sys.modules["megatron.core.extensions"] = extensions_mod
+    sys.modules["megatron.core.extensions.transformer_engine"] = transformer_engine_mod
     sys.modules["megatron.core.models"] = models_mod
     sys.modules["megatron.core.models.gpt"] = gpt_mod
     sys.modules["megatron.core.models.gpt.gpt_layer_specs"] = gpt_layer_specs_mod
@@ -177,7 +189,10 @@ def test_linear_attention_forwards_cu_seqlens_to_chunk_kernel(
 
     monkeypatch.setattr(module, "get_chunk_gated_delta_rule", fake_get_chunk_gated_delta_rule)
 
-    layer = getattr(module, class_name)(make_config(), layer_idx=0, args=args)
+    layer_kwargs = {}
+    if class_name == "Qwen3_5GatedDeltaNet":
+        layer_kwargs["mcore_config"] = SimpleNamespace(init_method=None, output_layer_init_method=None)
+    layer = getattr(module, class_name)(make_config(), layer_idx=0, args=args, **layer_kwargs)
     hidden_states = torch.randn(1, 7, 32)
     cu_seqlens = torch.tensor([0, 3, 7], dtype=torch.int32)
 
