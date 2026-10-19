@@ -31,6 +31,13 @@ def test_weight_cache_disabled_only_when_trainer_is_offloaded(offload_train):
     assert getattr(args, "disable_parameter_transpose_cache", False) is offload_train
 
 
+def test_megatron_only_args_without_offload_train():
+    # Callers that parse only Megatron's arguments (like the parallel-consistency harness) lack offload_train.
+    args = Namespace(fp8_param_gather=False)
+    initialize._setup_sm120_mxfp8(args)
+    assert not hasattr(args, "disable_parameter_transpose_cache")
+
+
 def test_disable_flag_is_a_transformer_config_field():
     # core_transformer_config_from_args only copies args attributes that name a config field.
     assert "disable_parameter_transpose_cache" in {f.name for f in dataclasses.fields(TransformerConfig)}

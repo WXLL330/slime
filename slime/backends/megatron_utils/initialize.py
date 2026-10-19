@@ -72,7 +72,8 @@ def _setup_sm120_mxfp8(args):
     # the weight on every call, so under full recompute only the layer being computed holds a copy; the
     # extra quantization overlaps with communication. Measured on an 8-layer Qwen3.5-35B-A3B
     # (4 GPUs, TP2/EP4): step 67.9 -> 58.2 s, training peak -3.8 GiB, actor_train unchanged.
-    if args.offload_train:
+    # offload_train is a slime argument; Megatron-only callers (e.g. test harnesses) do not set it.
+    if getattr(args, "offload_train", False):
         args.disable_parameter_transpose_cache = True
         logger.info("Disabled TE's quantized weight cache: the trainer is offloaded between steps")
 
