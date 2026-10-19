@@ -177,17 +177,18 @@ def main():
     te_grouped_linear.general_grouped_gemm = instrument(te_grouped_linear.general_grouped_gemm, "grouped")
 
     if args.negative_control != "none":
-        transpose = sm120.transpose_columnwise_to_rowwise
+        transpose = sm120.transpose_columnwise_to_rowwise_batch
 
-        def broken_transpose(tensor):
-            out = transpose(tensor)
-            if args.negative_control == "scale_roll":
-                out._rowwise_scale_inv = out._rowwise_scale_inv.roll(1, dims=0).contiguous()
-            elif tensor._with_gemm_swizzled_scales:
-                out._rowwise_scale_inv = tensor._columnwise_scale_inv.t().contiguous()
+        def broken_transpose(tensors):
+            out = transpose(tensors)
+            for tensor, transposed in zip(tensors, out, strict=True):
+                if args.negative_control == "scale_roll":
+                    transposed._rowwise_scale_inv = transposed._rowwise_scale_inv.roll(1, dims=0).contiguous()
+                elif tensor._with_gemm_swizzled_scales:
+                    transposed._rowwise_scale_inv = tensor._columnwise_scale_inv.t().contiguous()
             return out
 
-        sm120.transpose_columnwise_to_rowwise = broken_transpose
+        sm120.transpose_columnwise_to_rowwise_batch = broken_transpose
 
     get_fp8_context = mcore_block.get_fp8_context
     mcore_block.get_fp8_context = lambda *a, **kw: (
