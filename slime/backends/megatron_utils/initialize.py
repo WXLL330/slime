@@ -53,6 +53,30 @@ def _initialize_distributed(args, get_embedding_ranks=None, get_position_embeddi
     )
 
 
+def _setup_sm120_mxfp8(args):
+    """Run TE's MXFP8 recipe on SM12x. Must happen before any TE module or TransformerConfig is built."""
+    if args.fp8_param_gather:
+        raise ValueError(
+            "--fp8-param-gather is not supported with --fp8-recipe mxfp8 on SM12x GPUs: the SM120 GEMM "
+            "patch and slime's MXFP8 weight sync are only verified with BF16 model parameters."
+        )
+    from .sm120_mxfp8 import apply_sm120_mxfp8_patch
+
+    apply_sm120_mxfp8_patch()
+    logger.info("Applied the SM120 MXFP8 patch to Transformer Engine")
+
+    # TE keeps each quantized weight (row- and column-wise MXFP8 copies, about the size of the BF16
+    # weight) across steps, although the first micro batch of every forward/backward re-quantizes it.
+    # When the trainer is offloaded between steps that cache is offloaded, pinned and restored for
+    # nothing, and holding it for all layers at once raises the training peak. Without it TE quantizes
+    # the weight on every call, so under full recompute only the layer being computed holds a copy; the
+    # extra quantization overlaps with communication. Measured on an 8-layer Qwen3.5-35B-A3B
+    # (4 GPUs, TP2/EP4): step 67.9 -> 58.2 s, training peak -3.8 GiB, actor_train unchanged.
+    if args.offload_train:
+        args.disable_parameter_transpose_cache = True
+        logger.info("Disabled TE's quantized weight cache: the trainer is offloaded between steps")
+
+
 def init(args):
     set_args(args)
     if args.enable_experimental:
@@ -61,15 +85,7 @@ def init(args):
 
     # TE disables MXFP8 on SM12x; the patch has to be in place before any TE module is built.
     if args.fp8 and args.fp8_recipe == "mxfp8" and torch.cuda.get_device_capability() >= (12, 0):
-        if args.fp8_param_gather:
-            raise ValueError(
-                "--fp8-param-gather is not supported with --fp8-recipe mxfp8 on SM12x GPUs: the SM120 GEMM "
-                "patch and slime's MXFP8 weight sync are only verified with BF16 model parameters."
-            )
-        from .sm120_mxfp8 import apply_sm120_mxfp8_patch
-
-        apply_sm120_mxfp8_patch()
-        logger.info("Applied the SM120 MXFP8 patch to Transformer Engine")
+        _setup_sm120_mxfp8(args)
 
     # Pytorch distributed.
     _initialize_distributed(args)
