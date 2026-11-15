@@ -29,6 +29,7 @@ from slime.backends.megatron_utils.hf_to_megatron.qwen import (
     qwen_hf_tensor,
     qwen_moe_hf_tensor,
 )
+from slime.backends.megatron_utils.hf_to_megatron.qwen3_5 import qwen3_5_hf_tensor
 from slime.backends.megatron_utils.hf_to_megatron.qwen3_next import qwen3_next_hf_tensor
 from slime.backends.megatron_utils.megatron_to_hf import _convert_to_hf_core
 from slime.backends.megatron_utils.megatron_to_hf.deepseekv3 import convert_deepseekv3_to_hf
@@ -240,6 +241,31 @@ def test_qwen_moe_merges_one_global_expert():
     )
 
     assert torch.equal(loaded, torch.cat((gate, up)))
+
+
+@pytest.mark.unit
+def test_qwen3_5_loads_fused_and_per_expert_decoder_experts():
+    gate_up = torch.randn(4, 6, 3)
+    down = torch.randn(4, 3, 3)
+    fused = Reader(
+        **{
+            "model.language_model.layers.1.mlp.experts.gate_up_proj": gate_up,
+            "model.language_model.layers.1.mlp.experts.down_proj": down,
+        }
+    )
+    per_expert = Reader(
+        **{
+            "model.language_model.layers.1.mlp.experts.2.gate_proj.weight": gate_up[2, :3],
+            "model.language_model.layers.1.mlp.experts.2.up_proj.weight": gate_up[2, 3:],
+            "model.language_model.layers.1.mlp.experts.2.down_proj.weight": down[2],
+        }
+    )
+
+    for reader in (fused, per_expert):
+        fc1 = qwen3_5_hf_tensor("module.module.decoder.layers.1.mlp.experts.linear_fc1.weight2", reader, _config())
+        fc2 = qwen3_5_hf_tensor("module.module.decoder.layers.1.mlp.experts.linear_fc2.weight2", reader, _config())
+        assert torch.equal(fc1, gate_up[2])
+        assert torch.equal(fc2, down[2])
 
 
 @pytest.mark.unit
