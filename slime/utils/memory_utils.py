@@ -1,3 +1,4 @@
+import ctypes
 import gc
 import logging
 
@@ -16,6 +17,16 @@ def clear_memory(clear_host_memory: bool = False):
     accelerator.empty_cache()
     if clear_host_memory:
         torch._C._host_emptyCache()
+        # glibc keeps freed small/medium chunks (e.g. the many per-expert temporaries of a torch_dist
+        # checkpoint load or save) in its arenas; return them to the OS so host memory doesn't ratchet up.
+        _malloc_trim()
+
+
+def _malloc_trim():
+    try:
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except OSError:  # not glibc
+        pass
 
 
 def available_memory():
