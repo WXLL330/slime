@@ -78,6 +78,22 @@ def _setup_sm120_mxfp8(args):
         logger.info("Disabled TE's quantized weight cache: the trainer is offloaded between steps")
 
 
+def _patch_grouped_linear_empty_extra_state():
+    """TE saves an empty extra state for stateless recipes such as MXFP8, but Megatron's
+    TEGroupedLinear._split_extra_state still decodes and indexes it when saving a checkpoint.
+    Hand the empty state to every GEMM instead."""
+    from megatron.core.extensions.transformer_engine import TEGroupedLinear
+
+    split_extra_state = TEGroupedLinear._split_extra_state
+
+    def _split_extra_state(self, state):
+        if isinstance(state, torch.Tensor) and state.numel() == 0:
+            return [state] * self.num_gemms
+        return split_extra_state(self, state)
+
+    TEGroupedLinear._split_extra_state = _split_extra_state
+
+
 def init(args):
     set_args(args)
     if args.enable_experimental:
@@ -87,6 +103,8 @@ def init(args):
     # TE disables MXFP8 on SM12x; the patch has to be in place before any TE module is built.
     if args.fp8 and args.fp8_recipe == "mxfp8" and torch.cuda.get_device_capability() >= (12, 0):
         _setup_sm120_mxfp8(args)
+    if args.fp8 and args.fp8_recipe == "mxfp8":
+        _patch_grouped_linear_empty_extra_state()
 
     # Pytorch distributed.
     _initialize_distributed(args)

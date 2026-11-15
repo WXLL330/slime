@@ -46,3 +46,17 @@ def test_disable_flag_is_a_transformer_config_field():
 def test_fp8_param_gather_is_rejected():
     with pytest.raises(ValueError, match="fp8-param-gather"):
         initialize._setup_sm120_mxfp8(Namespace(fp8_param_gather=True, offload_train=True))
+
+
+def test_grouped_linear_splits_empty_mxfp8_extra_state(monkeypatch):
+    # TE stores no extra state for MXFP8; saving a checkpoint used to fail on decoding it.
+    from types import SimpleNamespace
+
+    import torch
+    from megatron.core.extensions.transformer_engine import TEGroupedLinear
+
+    monkeypatch.setattr(TEGroupedLinear, "_split_extra_state", TEGroupedLinear._split_extra_state)
+    initialize._patch_grouped_linear_empty_extra_state()
+    empty = torch.empty(0, dtype=torch.uint8)
+    module = SimpleNamespace(num_gemms=3)
+    assert TEGroupedLinear._split_extra_state(module, empty) == [empty] * 3
